@@ -49,12 +49,6 @@ def plot_bars(data, ylabel, title, machine_label, test_labels, fname):
     ind = np.arange(N)
     width = 0.25
 
-    #if "Turnaround" in title:
-    #    for i in range(1, len(data[0].yvals)):
-    #        data[0].yvals[i] += 0.1 * data[0].yvals[0]
-    #        data[1].yvals[i] += 0.1 * data[1].yvals[0]
-    #        data[2].yvals[i] += 0.1 * data[2].yvals[0]
-
     if "Utilization" in title:
         plt.ylim(0, 100)
 
@@ -94,8 +88,10 @@ def plot_bars(data, ylabel, title, machine_label, test_labels, fname):
     plt.clf()
 
 
-test_dirs = ["uniform_scaling", "aggressive_shrink", "aggressive_priority"]
-test_labels = ["Inelastic", "Uniform Scaling", "Aggressive Shrink", "Aggressive Priority"]
+test_dirs = ["conservative", "aggressive_grow", "dynamic"]
+
+test_labels = ["Inelastic", "Conservative", "Aggressive Grow", "Dynamic"]
+
 machine_names = ["perlmutter_gpu", "perlmutter_cpu", "cori_haswell", "cori_knl"]
 machine_labels = ["Perlmutter GPU", "Perlmutter CPU", "Cori Haswell", "Cori KNL"]
 machine_dirs = ["output_trials_perlmutter_gpu", "output_trials_perlmutter_cpu", "output_trials_cori_haswell", "output_trials_cori_knl"]

@@ -30,12 +30,21 @@ def get_file_list(directory):
     f_list.sort()
     return f_list
 
-def get_jobs_from_files(file_list, percent_elastic, scaling_min, seed):
-    sub_queue = JobQueue(-1, default_policy)
+def get_jobs_from_files(file_list, percent_elastic, scaling_min, seed, node_mem, bw):
+    sub_queue = JobQueue(-1, default_policy, '')
+
+    node_breaks = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+    time_breaks = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+    heatmap = []
+    for i in range(0, len(time_breaks)):
+        heatmap.append([])
+        for j in range(0, len(node_breaks)):
+            heatmap[-1].append(0)
 
     if seed < 0:
         seed = random.randrange(0, 1024)
     random.seed(seed)
+    jid = 0
 
     for f in file_list:
         fptr = open(f, "r")
@@ -56,7 +65,7 @@ def get_jobs_from_files(file_list, percent_elastic, scaling_min, seed):
                 t_idx = i
                 
         line = fptr.readline()
-        jid = 0
+        #jid = 0
         count = 0
         while line:
             line = line.replace(',', '')
@@ -68,9 +77,21 @@ def get_jobs_from_files(file_list, percent_elastic, scaling_min, seed):
                 break
             if line[n_idx] == '' or line[s_idx] == '' or line[t_idx] == '':
                 break
-            nodes  = int(line[n_idx])
+            nodes  = float(line[n_idx])
             submit = line[s_idx]
             dur    = float(line[t_idx])
+            
+            time_offset = -1
+            for i in range(0, len(time_breaks)):
+                time_offset = i
+                if dur <= time_breaks[i]:
+                    break
+            node_offset = -1
+            for i in range(0, len(node_breaks)):
+                node_offset = i
+                if nodes <= node_breaks[i]:
+                    break
+            heatmap[time_offset][node_offset] += 1
 
             # Convert submit time string to timestamp
             submit = time.mktime(datetime.strptime(submit, "%Y-%m-%d %H:%M:%S").timetuple())
@@ -79,6 +100,7 @@ def get_jobs_from_files(file_list, percent_elastic, scaling_min, seed):
                     job = Job(jid, nodes, 0, True)
                 else:
                     job = Job(jid, nodes, 0, False)
+                jid += 1
                 job.timestamp = submit
                 job.duration = dur
                 job.init_duration = dur
@@ -87,11 +109,36 @@ def get_jobs_from_files(file_list, percent_elastic, scaling_min, seed):
                         job.scaling_factor = random.uniform(scaling_min, 1.0)
                     else:
                         job.scaling_factor = 1.0
+                    # Determine overhead values
+                    # 75% of jobs <25% of memory and 25% 25->50% (Assume 256GB mem and 20GB/s bandwidth)
+                    #node_mem = 256.0 + 160.0
+                    mem_midpoint = node_mem * 0.25
+                    #bw = 20.0 * 4
+                    num = random.uniform(0.0, 1.0)
+                    gb = 0.0
+                    if num < 0.75:
+                        gb = random.uniform(0.01, 1.0) * mem_midpoint
+                    else:
+                        gb = (random.uniform(0.0, 1.0) * mem_midpoint) + mem_midpoint
+                    t = gb / bw
+                    job.grow_overhead = 0.5 * t
+                    job.shrink_overhead = t
+                    
                     sub_queue.elastic_push(job)
                 else:
                     sub_queue.push(job)
-                jid += 1
+                #jid += 1
             line = fptr.readline()
+    ofile = open("job_heatmap.csv", "w+")
+    for i in range(0, len(node_breaks)):
+        ofile.write(",%d" % node_breaks[i])
+    ofile.write("\n")
+    for i in range(0, len(time_breaks)):
+        ofile.write("%d" % time_breaks[i])
+        for j in range(0, len(node_breaks)):
+            ofile.write(",%d" % heatmap[i][j])
+        ofile.write("\n")
+        print(heatmap[i])
 
     # Sort the submitted jobs by their timestamps
     sub_queue.jobs = sorted(sub_queue.jobs, key=lambda x: x.timestamp)
@@ -100,8 +147,8 @@ def get_jobs_from_files(file_list, percent_elastic, scaling_min, seed):
     return sub_queue
 
 def simulation(run_queue, sub_queue, tick, fname):
-    complete_queue = JobQueue(run_queue.total_nodes, default_policy)
-    wait_queue = JobQueue(-1, default_policy)
+    complete_queue = JobQueue(run_queue.total_nodes, default_policy, '')
+    wait_queue = JobQueue(-1, default_policy, '')
 
     if sub_queue.num_jobs <= 0:
         print("Didn't find any jobs in the submit queue.  Ending simulation...")
@@ -121,7 +168,7 @@ def simulation(run_queue, sub_queue, tick, fname):
     
     # Initial Insertion
     run_queue.backfill(wait_queue, tick)
-    print("Available Nodes: %d" % run_queue.available_nodes)
+    print("Available Nodes: %.1f" % run_queue.available_nodes)
     print("Running Jobs:    %d" % run_queue.num_jobs)
 
     total_time = 0.0
@@ -132,7 +179,7 @@ def simulation(run_queue, sub_queue, tick, fname):
     ofile = open(fname + "_output.csv", "w+")
     line = "Timestamp,Elapsed Seconds,Available Nodes,Running Nodes,Running Jobs,Waiting Jobs,Submission Queue Size\n"
     ofile.write(line)
-    line = "%f,%f,%d,%d,%d,%d\n" % (timestamp, total_time, run_queue.available_nodes, run_queue.num_jobs, wait_queue.num_jobs, sub_queue.num_jobs)
+    line = "%f,%f,%.1f,%d,%d,%d\n" % (timestamp, total_time, run_queue.available_nodes, run_queue.num_jobs, wait_queue.num_jobs, sub_queue.num_jobs)
     ofile.write(line)
     while run_queue.num_jobs > 0 or sub_queue.num_jobs > 0:
         wait_queue.increment_wait(tick)
@@ -159,18 +206,41 @@ def simulation(run_queue, sub_queue, tick, fname):
         total_util += utilization
         total_timesteps += 1
         
-        print_string += "Total Nodes:     %d\n" % run_queue.total_nodes
-        print_string += "Available Nodes: %d\n" % run_queue.available_nodes
-        print_string += "Running Nodes:   %d\n" % (run_queue.total_nodes - run_queue.available_nodes)
+        print_string += "Total Nodes:     %.1f\n" % run_queue.total_nodes
+        print_string += "Available Nodes: %.1f\n" % run_queue.available_nodes
+        print_string += "Running Nodes:   %.1f\n" % (run_queue.total_nodes - run_queue.available_nodes)
         print_string += "Running Jobs:    %d\n" % run_queue.num_jobs
         print_string += "Waiting Jobs:    %d\n" % wait_queue.num_jobs
         print_string += "Utilization:     %.2f%%\n" % utilization
+        if run_queue.num_jobs > (run_queue.total_nodes - run_queue.available_nodes):
+            print("\n\n\n%d jobs and %.1f nodes... how?\n\n\n")
+            for x in range(0, run_queue.num_elastic_jobs):
+                run_queue.elastic_jobs[x].print_job()
+            exit()
 
-        line = "%f,%f,%d,%d,%d,%d,%d\n" % (timestamp, total_time, run_queue.available_nodes, run_queue.total_nodes - run_queue.available_nodes, run_queue.num_jobs, wait_queue.num_jobs, sub_queue.num_jobs)
+        line = "%f,%f,%.1f,%.1f,%d,%d,%d\n" % (timestamp, total_time, run_queue.available_nodes, run_queue.total_nodes - run_queue.available_nodes, run_queue.num_jobs, wait_queue.num_jobs, sub_queue.num_jobs)
         ofile.write(line)
-        
+
+        cutoff = 0.02
+        if run_queue.dynamic:
+            if run_queue.available_nodes / run_queue.total_nodes < cutoff and wait_queue.num_jobs > 0:
+                run_queue.shrink_policy = "mp"
+            else:
+                run_queue.shrink_policy = "ip"
+        n1 = run_queue.available_nodes
         run_queue.backfill(wait_queue, tick)
+
+        cutoff = 0.10
+        if run_queue.dynamic:
+            if run_queue.available_nodes / run_queue.total_nodes > cutoff and wait_queue.num_jobs == 0:
+                run_queue.elastic_policy = "a"
+            else:
+                run_queue.elastic_policy = "c"
+        n2 = run_queue.available_nodes
         run_queue.elastic_grow()
+        n3 = run_queue.available_nodes
+        #if n1 < n2:
+        #    print("%.1f -> %.1f -> %.1f" % (n1, n2, n3))
         
         # Ticks are in seconds
         days = int(total_time/86400)
@@ -191,11 +261,13 @@ def parse_conf(conf):
     outfile    = "simulator"
     ratio      = 0.0
     elastic_policy = "gsc"
-    total_nodes = 1
+    total_nodes = 1.0
     random_seed = 0
     tick_rate = 1
     scaling_min = 1.0
     grow_steps = 1
+    node_mem = 256.0
+    nic_bw = 20.0
     
     with open(conf, "r") as f:
         for line in f:
@@ -212,7 +284,7 @@ def parse_conf(conf):
                 elif line[0] == "elastic_policy":
                     elastic_policy = line[1]
                 elif line[0] == "total_nodes":
-                    total_nodes = int(line[1])
+                    total_nodes = float(line[1])
                 elif line[0] == "random_seed":
                     random_seed = int(line[1])
                 elif line[0] == "tick_rate":
@@ -221,19 +293,24 @@ def parse_conf(conf):
                     scaling_min = float(line[1])
                 elif line[0] == "grow_steps":
                     grow_steps = int(line[1])
+                elif line[0] == "node_memory":
+                    node_mem = float(line[1])
+                elif line[0] == "nic_bandwidth":
+                    nic_bw = float(line[1])
                 else:
                     continue
-    return infile_dir, outfile, ratio, elastic_policy, total_nodes, random_seed, tick_rate, scaling_min, grow_steps
+    return infile_dir, outfile, ratio, elastic_policy, total_nodes, random_seed, tick_rate, scaling_min, grow_steps, node_mem, nic_bw
 
-infile_dir, fname, elastic_ratio, elastic_policy, num_nodes, seed, tick, scaling_min, grow_steps = parse_conf(sys.argv[1])
+infile_dir, fname, elastic_ratio, elastic_policy, num_nodes, seed, tick, scaling_min, grow_steps, node_mem, nic_bw = parse_conf(sys.argv[1])
 
 file_list = get_file_list(infile_dir)
-submit_queue = get_jobs_from_files(file_list, elastic_ratio, scaling_min, seed)
-run_queue  = JobQueue(num_nodes, elastic_policy)
+submit_queue = get_jobs_from_files(file_list, elastic_ratio, scaling_min, seed, node_mem, nic_bw)
+run_queue  = JobQueue(num_nodes, elastic_policy, fname)
 run_queue.grow_steps = grow_steps
 
 # Profile the simulation to see where the time is spent
-cProfile.run('complete_queue, avg_util = simulation(run_queue, submit_queue, tick, fname)')
+#cProfile.run('complete_queue, avg_util = simulation(run_queue, submit_queue, tick, fname)')
+complete_queue, avg_util = simulation(run_queue, submit_queue, tick, fname)
 
 # Plot the simulation
 d = PlotData()
@@ -299,6 +376,15 @@ stats_string += ("Expected Time: %f sec\n" % expected_time)
 stats_string += ("Increase Time: %f sec (%d jobs)\n" % (increase_time, num_increase))
 stats_string += ("Decrease Time: %f sec (%d jobs)\n" % (decrease_time, num_decrease))
 stats_string += ("Average Utilization: %.2f%%\n" % avg_util)
+stats_string += ("##### Overhead Estimate #####\n")
+stats_string += ("Num Resizes: %.2f\n" % (run_queue.resize_count))
+stats_string += ("Num Grows:   %.2f\n" % (run_queue.grow_count))
+stats_string += ("Num Shrinks: %.2f\n" % (run_queue.shrink_count))
+stats_string += ("Average Resizes: %.2f\n" % (float(run_queue.resize_count) / float(complete_queue.num_elastic_jobs)))
+stats_string += ("Nodes Resized: %.2f\n" % (run_queue.resize_nodes))
+stats_string += ("Overhead Estimate: %.2f%%\n" % ( ((((run_queue.resize_count*0.5) + (run_queue.resize_nodes*0.1)) * 2.0) / (total_run+total_wait)) * 100.0 ))
+stats_string += ("Ovherhead Added (actual): %.2f seconds\n" % run_queue.total_overhead)
+stats_string += ("Overhead Percentage: %.2f%%\n" % ((run_queue.total_overhead / (total_run+total_wait))*100.0) )
 
 print(stats_string)
 ofile = open(fname + "_stats.txt", "w+")

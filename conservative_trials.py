@@ -5,7 +5,7 @@ import os
 input_dirs = ['perlmutter_gpu', 'perlmutter_cpu', 'cori_haswell', 'cori_knl']
 prefixes = ['elastic_5', 'elastic_10', 'elastic_25', 'elastic_50', 'elastic_75', 'elastic_100']
 elastic_ratios = ['0.05', '0.1', '0.25', '0.5', '0.75', '1.0']
-elastic_policy = 'gscm'
+elastic_policy = 'gsc'
 total_nodes = ['1792', '3072', '2388', '9688']
 random_seed = '1'
 tick_rate = '1.0'
@@ -29,6 +29,18 @@ for i in range(0, len(input_dirs)):
             ofile.write("tick_rate %s\n" % tick_rate)
             ofile.write("scaling_min %s\n" % scaling_min)
             ofile.write("grow_steps %s\n" % grow_steps)
+            if 'gpu' in input_dirs[i]:
+                ofile.write("node_memory 416.0\n")
+                ofile.write("nic_bandwidth 80.0\n")
+            elif 'cpu' in input_dirs[i]:
+                ofile.write("node_memory 512.0\n")
+                ofile.write("nic_bandwidth 20.0\n")
+            elif 'haswell' in input_dirs[i]:
+                ofile.write("node_memory 128.0\n")
+                ofile.write("nic_bandwidth 10.0\n")
+            elif 'knl' in input_dirs[i]:
+                ofile.write("node_memory 112.0\n")
+                ofile.write("nic_bandwidth 10.0\n")
 
             ofile.close()
             print("Running Simulator for %s..." % conf_fname)

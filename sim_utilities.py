@@ -1,27 +1,33 @@
 import random
 import json
+import math
 
 class Job:
     def __init__(self, jid, nodes, hours, elastic):
         self.jid = jid
-        self.nodes = nodes
+        self.nodes = float(nodes)
         self.hours = hours
         self.wait_time = 0.0
         self.run_time = 0.0
         self.is_elastic = elastic
-        self.cur_nodes = nodes
+        self.cur_nodes = float(nodes)
         self.timestamp = None
         self.duration = 0.0
         self.init_duration = 0.0
         self.scaling_factor = 1.0
+        self.resize_time = 0.0
+        self.grow_overhead = 0.0
+        self.shrink_overhead = 0.0
+        self.num_resizes = -1
     def print_job(self):
         # Assumption: Hours only have one decimal place
-        print("[%d] Nodes: %d\tInit Duration: %.2f sec\tSubmit Timestamp: %s" % (self.jid, self.nodes, self.init_duration, self.timestamp))
+        print("[%d] Nodes: %.1f\tCurrent Nodes: %.1f\tInit Duration: %.2f sec\tSubmit Timestamp: %s" % (self.jid, self.nodes, self.cur_nodes, self.init_duration, self.timestamp))
         print("     Wait Time: %.2f sec\tRun Time: %.2f sec\tElastic: %s" % (self.wait_time, self.run_time, self.is_elastic))
+        print("     Grow Overhead: %.2f\tShrink Overhead: %.2f\tDuration: %.2f\tResize Time: %.2f" % (self.grow_overhead, self.shrink_overhead, self.duration, self.resize_time))
 
 # Assume that job ids are always increasing
 class JobQueue:
-    def __init__(self, total_nodes, policy):
+    def __init__(self, total_nodes, policy, outfile_base):
         self.jobs = []
         self.elastic_jobs = []
         self.num_jobs = 0
@@ -34,6 +40,20 @@ class JobQueue:
         self.num_grow = 0
         self.grow_steps = 1
         self.wait_count = 0
+        self.shrink_capacity = 0
+
+        self.resize_count = 0
+        self.grow_count = 0
+        self.shrink_count = 0
+        self.resize_nodes = 0
+        self.base_overhead = 0.5
+        self.node_overhead = 0.1
+        self.total_overhead = 0.0
+        self.max_resizes = 1500
+        self.dynamic = False
+        if outfile_base != '':
+            self.resize_file = open(outfile_base + "_resize_data.csv", "w+")
+            self.resize_file.write("Job ID,Grow/Shrink,Before,After\n")
 
         if "g" in policy:
             self.allow_grow = True
@@ -57,6 +77,10 @@ class JobQueue:
                 self.shrink_policy = "ip"
             else:
                 self.shrink_policy = "i"
+        if "d" in policy:
+            self.dynamic = True
+            self.elastic_policy = "c"
+            self.shrink_policy = "ip"
 
     def push(self, job):
         self.jobs.append(job)
@@ -65,6 +89,7 @@ class JobQueue:
         self.available_nodes -= job.nodes
         self.max_jid = job.jid
     def elastic_push(self, job):
+        job.num_resizes += 1
         self.elastic_jobs.append(job)
         self.num_jobs += 1
         self.num_elastic_jobs += 1
@@ -74,6 +99,8 @@ class JobQueue:
             self.num_shrink += 1
         if job.cur_nodes > job.nodes:
             self.num_grow += 1
+        if job.cur_nodes >= job.nodes and job.cur_nodes > 1.0:
+            self.shrink_capacity += math.ceil(job.cur_nodes / 2.0)
     def pop(self, index):
         job = self.jobs.pop(index)
         self.num_jobs -= 1
@@ -89,37 +116,92 @@ class JobQueue:
             self.num_shrink -= 1
         if job.cur_nodes > job.nodes:
             self.num_grow -= 1
+        if job.cur_nodes >= job.nodes and job.cur_nodes > 1.0:
+            self.shrink_capacity -= math.ceil(job.cur_nodes / 2.0)
+            #self.shrink_capacity -= job.cur_nodes / 2
         return job
-    # Assumption: We only grow one job at a time
     def elastic_grow(self):
         grew = False
         if self.available_nodes == 0:
             return grew
-        # We've already grown all of the jobs
-        #if self.num_grow == self.num_elastic_jobs:
-        #    return grew
+
+        # Check all smaller jobs for grow first
         for i in range(0, self.num_elastic_jobs):
             job = self.elastic_jobs[i]
-            # This job has either been shrunk or hasn't grown
-            #if job.cur_nodes <= job.nodes and self.available_nodes >= job.cur_nodes * 2:
-            if job.cur_nodes <= (job.nodes * (2**(self.grow_steps-1))) and self.available_nodes >= job.cur_nodes * 2:
-                # The policy is to not grow larger than the original size
-                if job.cur_nodes == job.nodes and not self.allow_grow:
-                    continue
+            inc = 0.0
+            if job.cur_nodes < job.nodes:
+                inc = job.nodes - job.cur_nodes
+            else:
+                inc = job.cur_nodes
+            # This job has been shrunk
+            #if job.cur_nodes < job.nodes and self.available_nodes >= job.cur_nodes * 2 and job.resize_time <= 0:
+            #if job.cur_nodes <= 4 and job.cur_nodes <= (job.nodes * (2**(self.grow_steps-1))) and self.available_nodes >= job.cur_nodes * 2 and job.resize_time <= 0:
+            if job.cur_nodes <= 4 and job.cur_nodes <= (job.nodes * (2**(self.grow_steps-1))) and self.available_nodes >= inc and job.resize_time <= 0 and job.num_resizes < self.max_resizes:
                 temp = job
+                self.resize_file.write("%d,%s,%d,%d\n" % (temp.jid, 'g', temp.cur_nodes, temp.cur_nodes*2))
+                self.resize_count += 1
+                self.grow_count += 1
+                self.resize_nodes += (temp.cur_nodes*2) - temp.cur_nodes
                 # Remove from the queue and re-add it so we have a least-recently-updated
                 # pattern for re-sizing jobs.
                 self.elastic_pop(i)
-                temp.cur_nodes *= 2
+                #temp.resize_time = self.base_overhead + self.node_overhead*temp.cur_nodes
+                temp.resize_time = temp.grow_overhead * (temp.nodes / temp.cur_nodes)
+                self.total_overhead += temp.resize_time
+                #temp.cur_nodes *= 2
+                temp.cur_nodes += inc
+
                 self.elastic_push(temp)
                 grew = True
 
                 if self.elastic_policy == "c":
                     # This makes it so we grow exactly one job
                     return grew
-                elif self.elastic_policy == "a":
+                #elif self.elastic_policy == "a":
                     # This makes it so we grow as many jobs as we can
+                #    continue
+        
+        # Check all elastic jobs for grow
+        for i in range(0, self.num_elastic_jobs):
+            # If there are less than 5% of nodes available, stop growing.
+            #if self.available_nodes / self.total_nodes < 0.05:
+            #    break
+            job = self.elastic_jobs[i]
+            inc = 0.0
+            if job.cur_nodes < job.nodes:
+                inc = job.nodes - job.cur_nodes
+            else:
+                inc = job.cur_nodes
+            # This job has either been shrunk or hasn't grown
+            #if job.cur_nodes <= job.nodes and self.available_nodes >= job.cur_nodes * 2:
+            #if job.cur_nodes <= (job.nodes * (2**(self.grow_steps-1))) and self.available_nodes >= job.cur_nodes * 2 and job.resize_time <= 0:
+            if job.cur_nodes <= (job.nodes * (2**(self.grow_steps-1))) and self.available_nodes >= inc and job.resize_time <= 0 and job.num_resizes < self.max_resizes:
+                # The policy is to not grow larger than the original size
+                if job.cur_nodes == job.nodes and not self.allow_grow:
                     continue
+                temp = job
+                self.resize_file.write("%d,%s,%d,%d\n" % (temp.jid, 'g', temp.cur_nodes, temp.cur_nodes*2))
+                self.resize_count += 1
+                self.grow_count += 1
+                self.resize_nodes += (temp.cur_nodes*2) - temp.cur_nodes
+                # Remove from the queue and re-add it so we have a least-recently-updated
+                # pattern for re-sizing jobs.
+                self.elastic_pop(i)
+                #temp.resize_time = self.base_overhead + self.node_overhead*temp.cur_nodes
+                temp.resize_time = temp.grow_overhead * (temp.nodes / temp.cur_nodes)
+                self.total_overhead += temp.resize_time
+                #temp.cur_nodes *= 2
+                temp.cur_nodes += inc
+
+                self.elastic_push(temp)
+                grew = True
+
+                #if self.available_nodes / self.total_nodes < 0.05:
+                #    return grew
+
+                if self.elastic_policy == "c":
+                    # This makes it so we grow exactly one job
+                    return grew
         return grew
     def individual_elastic_shrink(self):
         # We've already shrunk all of the elastic jobs
@@ -131,13 +213,25 @@ class JobQueue:
             # least-recently-updated job in the elastic job queue
             # Allow shrinking below the normal job size and take the first element
             # the queue that isn't already shrunk down.
-            if job.cur_nodes >= job.nodes:
+            if job.cur_nodes >= job.nodes and job.resize_time <= 0 and job.cur_nodes > 1.0 and job.num_resizes < self.max_resizes:
                 # Check if the policy is to not shrink smaller than the original size
                 if job.cur_nodes == job.nodes and not self.allow_shrink:
                     continue
                 temp = job
+                self.resize_file.write("%d,%s,%d,%d\n" % (temp.jid, 's', temp.cur_nodes, temp.cur_nodes/2))
+                self.resize_count += 1
+                self.shrink_count += 1
+                self.resize_nodes += temp.cur_nodes - (temp.cur_nodes/2)
                 self.elastic_pop(i)
-                temp.cur_nodes /= 2
+                #temp.resize_time = self.base_overhead + (self.node_overhead * (temp.cur_nodes/2))
+                temp.resize_time = temp.shrink_overhead * (temp.nodes / temp.cur_nodes)
+                self.total_overhead += temp.resize_time
+                #temp.cur_nodes /= 2
+                temp.cur_nodes = math.ceil(temp.cur_nodes / 2)
+                if temp.cur_nodes < 1.0:
+                    print("Shrink 1: %.2f" % temp.cur_nodes)
+                    temp.print_job()
+                    exit()
                 self.elastic_push(temp)
                 # This makes it so we shrink exactly one job
                 return True
@@ -152,13 +246,25 @@ class JobQueue:
             # least-recently-updated job in the elastic job queue
             # Allow shrinking below the normal job size and take the first element
             # the queue that isn't already shrunk down.
-            if job.cur_nodes > job.nodes:
+            if job.cur_nodes > job.nodes and job.resize_time <= 0 and job.cur_nodes > 1.0 and job.num_resizes < self.max_resizes:
                 # Check if the policy is to not shrink smaller than the original size
                 if job.cur_nodes == job.nodes and not self.allow_shrink:
                     continue
                 temp = job
+                self.resize_file.write("%d,%s,%d,%d\n" % (temp.jid, 's', temp.cur_nodes, temp.cur_nodes/2))
+                self.resize_count += 1
+                self.shrink_count += 1
+                self.resize_nodes += temp.cur_nodes - (temp.cur_nodes/2)
                 self.elastic_pop(i)
-                temp.cur_nodes /= 2
+                #temp.resize_time = self.base_overhead + (self.node_overhead * (temp.cur_nodes/2))
+                temp.resize_time = temp.shrink_overhead * (temp.nodes / temp.cur_nodes)
+                self.total_overhead += temp.resize_time
+                #temp.cur_nodes /= 2
+                temp.cur_nodes = math.ceil(temp.cur_nodes / 2)
+                if temp.cur_nodes < 1.0:
+                    print("Shrink 2: %.2f" % temp.cur_nodes)
+                    temp.print_job()
+                    exit()
                 self.elastic_push(temp)
                 # This makes it so we shrink exactly one job
                 return True
@@ -171,10 +277,22 @@ class JobQueue:
             # least-recently-updated job in the elastic job queue
             # Allow shrinking below the normal job size and take the first element
             # the queue that isn't already shrunk down.
-            if job.cur_nodes == job.nodes:
+            if job.cur_nodes == job.nodes and job.resize_time <= 0 and job.cur_nodes > 1.0 and job.num_resizes < self.max_resizes:
                 temp = job
+                self.resize_file.write("%d,%s,%d,%d\n" % (temp.jid, 's', temp.cur_nodes, temp.cur_nodes/2))
+                self.resize_count += 1
+                self.shrink_count += 1
+                self.resize_nodes += temp.cur_nodes - (temp.cur_nodes/2)
                 self.elastic_pop(i)
-                temp.cur_nodes /= 2
+                #temp.resize_time = self.base_overhead + (self.node_overhead * (temp.cur_nodes/2))
+                temp.resize_time = temp.shrink_overhead * (temp.nodes / temp.cur_nodes)
+                self.total_overhead += temp.resize_time
+                #temp.cur_nodes /= 2
+                temp.cur_nodes = math.ceil(temp.cur_nodes / 2)
+                if temp.cur_nodes < 1.0:
+                    print("Shrink 3: %.2f" % temp.cur_nodes)
+                    temp.print_job()
+                    exit()
                 self.elastic_push(temp)
                 # This makes it so we shrink exactly one job
                 return True
@@ -183,48 +301,7 @@ class JobQueue:
         # We've already shrunk all of the elastic jobs
         if self.num_shrink == self.num_elastic_jobs:
             return False
-        marked = []
-        nodes_freed = 0
-        num_marked = 0
-        for i in range(0, self.num_elastic_jobs):
-            job = self.elastic_jobs[i]
-            # Take the first job with increased number of nodes because this is the
-            # least-recently-updated job in the elastic job queue
-            # Allow shrinking below the normal job size and take the first element
-            # the queue that isn't already shrunk down.
-            if job.cur_nodes >= job.nodes:
-                # Check if the policy is to not shrink smaller than the original size
-                if job.cur_nodes == job.nodes and not self.allow_shrink:
-                    continue
-                marked.append(i)
-                num_marked += 1
-                nodes_freed += job.cur_nodes / 2
-                # This makes it so we continue to shrink until we have the number
-                # of nodes needed or we have completed one full pass through the
-                # elastic 
-                if self.available_nodes - nodes_freed >= nodes_needed:
-                    break
-        if nodes_freed > 0:
-            i = 0
-            j = marked[i]
-            while True:
-                temp = self.elastic_jobs[j]
-                self.elastic_pop(j)
-                temp.cur_nodes /= 2
-                self.elastic_push(temp)
-
-                i += 1
-                if i == num_marked:
-                    break
-                # Since we popped an element from the queue, all of the marked
-                # indices need to decrease by 1
-                for k in range(i, num_marked):
-                    marked[k] -= 1
-                j = marked[i]
-        return False
-    def multiple_elastic_shrink_priority(self, nodes_needed):
-        # We've already shrunk all of the elastic jobs
-        if self.num_shrink == self.num_elastic_jobs:
+        if self.shrink_capacity < nodes_needed:
             return False
         marked = []
         nodes_freed = 0
@@ -235,7 +312,7 @@ class JobQueue:
             # least-recently-updated job in the elastic job queue
             # Allow shrinking below the normal job size and take the first element
             # the queue that isn't already shrunk down.
-            if job.cur_nodes > job.nodes:
+            if job.cur_nodes >= job.nodes and job.resize_time <= 0 and job.cur_nodes >= 2.0 and job.num_resizes < self.max_resizes:
                 # Check if the policy is to not shrink smaller than the original size
                 if job.cur_nodes == job.nodes and not self.allow_shrink:
                     continue
@@ -245,7 +322,59 @@ class JobQueue:
                 # This makes it so we continue to shrink until we have the number
                 # of nodes needed or we have completed one full pass through the
                 # elastic 
-                if self.available_nodes - nodes_freed >= nodes_needed:
+                if self.available_nodes + nodes_freed >= nodes_needed:
+                    break
+        marked.sort()
+        if nodes_freed > 0:
+            i = 0 # Index into 'marked' list and number of shrinks completed
+            while True:
+                idx = marked[i]-i
+                temp = self.elastic_jobs[idx]
+
+                self.resize_file.write("%d,%s,%d,%d\n" % (temp.jid, 's', temp.cur_nodes, temp.cur_nodes/2))
+                self.resize_count += 1
+                self.shrink_count += 1
+                self.resize_nodes += temp.cur_nodes - math.ceil(temp.cur_nodes/2)
+                self.elastic_pop(idx)
+
+                temp.resize_time = temp.shrink_overhead * (temp.nodes / temp.cur_nodes)
+                self.total_overhead += temp.resize_time
+                temp.cur_nodes = math.ceil(temp.cur_nodes / 2)
+                self.elastic_push(temp)
+                
+                i += 1
+                if i == num_marked:
+                    break
+            return True            
+        return False
+    def multiple_elastic_shrink_priority(self, nodes_needed):
+        # We've already shrunk all of the elastic jobs
+        if self.num_shrink == self.num_elastic_jobs:
+            return False
+        if self.shrink_capacity < nodes_needed:
+            return False
+        marked = []
+
+        nodes_freed = 0
+        num_marked = 0
+        for i in range(0, self.num_elastic_jobs):
+            job = self.elastic_jobs[i]
+            # Take the first job with increased number of nodes because this is the
+            # least-recently-updated job in the elastic job queue
+            # Allow shrinking below the normal job size and take the first element
+            # the queue that isn't already shrunk down.
+            if job.cur_nodes > job.nodes and job.resize_time <= 0 and job.cur_nodes >= 2.0 and job.num_resizes < self.max_resizes:# and math.ceil(job.cur_nodes / 2) + nodes_freed + self.available_nodes <= nodes_needed:
+                # Check if the policy is to not shrink smaller than the original size
+                if job.cur_nodes == job.nodes and not self.allow_shrink:
+                    continue
+                marked.append(i)
+
+                num_marked += 1
+                nodes_freed += math.ceil(job.cur_nodes / 2)
+                # This makes it so we continue to shrink until we have the number
+                # of nodes needed or we have completed one full pass through the
+                # elastic 
+                if self.available_nodes + nodes_freed >= nodes_needed:
                     break
 
         for i in range(0, self.num_elastic_jobs):
@@ -257,32 +386,39 @@ class JobQueue:
             # least-recently-updated job in the elastic job queue
             # Allow shrinking below the normal job size and take the first element
             # the queue that isn't already shrunk down.
-            if job.cur_nodes == job.nodes:
+            if job.cur_nodes == job.nodes and job.resize_time <= 0 and job.cur_nodes >= 2.0 and job.num_resizes < self.max_resizes:# and math.ceil(job.cur_nodes / 2) + nodes_freed + self.available_nodes <= nodes_needed:
                 marked.append(i)
+
                 num_marked += 1
-                nodes_freed += job.cur_nodes / 2
+                nodes_freed += math.ceil(job.cur_nodes / 2)
                 # This makes it so we continue to shrink until we have the number
                 # of nodes needed or we have completed one full pass through the
                 # elastic 
-                if self.available_nodes - nodes_freed >= nodes_needed:
+                if self.available_nodes + nodes_freed >= nodes_needed:
                     break
-        if nodes_freed > 0:
-            i = 0
-            j = marked[i]
-            while True:
-                temp = self.elastic_jobs[j]
-                self.elastic_pop(j)
-                temp.cur_nodes /= 2
-                self.elastic_push(temp)
 
+        marked.sort()
+        if nodes_freed > 0:
+            i = 0 # Index into 'marked' list and number of shrinks completed
+            while True:
+                idx = marked[i]-i
+                temp = self.elastic_jobs[idx]
+
+                self.resize_file.write("%d,%s,%d,%d\n" % (temp.jid, 's', temp.cur_nodes, temp.cur_nodes/2))
+                self.resize_count += 1
+                self.shrink_count += 1
+                self.resize_nodes += temp.cur_nodes - math.ceil(temp.cur_nodes/2)
+                self.elastic_pop(idx)
+
+                temp.resize_time = temp.shrink_overhead * (temp.nodes / temp.cur_nodes)
+                self.total_overhead += temp.resize_time
+                temp.cur_nodes = math.ceil(temp.cur_nodes / 2)
+                self.elastic_push(temp)
+                
                 i += 1
                 if i == num_marked:
                     break
-                # Since we popped an element from the queue, all of the marked
-                # indices need to decrease by 1
-                for k in range(i, num_marked):
-                    marked[k] -= 1
-                j = marked[i]
+            return True            
         return False
     def next_jid(self):
         return self.max_jid + 1
@@ -304,10 +440,27 @@ class JobQueue:
                     return inserted
         else:
             nodes_needed = 0
-            if queue.num_normal_jobs > 0:
-                nodes_needed += queue.jobs[0].cur_nodes
-            if queue.num_elastic_jobs > 0:
-                nodes_needed += queue.elastic_jobs[0].cur_nodes
+            #nodes_needed = self.available_nodes * -1
+            #if queue.num_normal_jobs > 0:
+            #    nodes_needed += queue.jobs[0].cur_nodes
+            #if queue.num_elastic_jobs > 0:
+            #    nodes_needed += queue.elastic_jobs[0].cur_nodes
+            i = 0 # Normal job queue index
+            j = 0 # Elastic job queue index
+            while nodes_needed <= self.shrink_capacity:
+                if i < queue.num_normal_jobs:
+                    new_sum = nodes_needed + queue.jobs[i].cur_nodes
+                    if new_sum < self.shrink_capacity:
+                        nodes_needed = new_sum
+                if j < queue.num_elastic_jobs:
+                    new_sum = nodes_needed + queue.elastic_jobs[j].cur_nodes
+                    if new_sum < self.shrink_capacity:
+                        nodes_needed = new_sum
+                i += 1
+                j += 1
+                if i >= queue.num_normal_jobs and j >= queue.num_elastic_jobs:
+                    break
+            
             if nodes_needed > 0:
                 if "p" in self.shrink_policy:
                     self.multiple_elastic_shrink_priority(nodes_needed)
@@ -416,12 +569,34 @@ class JobQueue:
             # Assumption: Jobs only grow by exactly double or half of their
             #             requested node count
             if self.elastic_jobs[i].cur_nodes < self.elastic_jobs[i].nodes:
-                self.elastic_jobs[i].duration -= tick / (2.0 * self.elastic_jobs[i].scaling_factor)
+                #self.elastic_jobs[i].duration -= tick / (2.0 * self.elastic_jobs[i].scaling_factor)
+                # Assumes exactly one shrink step!
+                if self.elastic_jobs[i].resize_time >= 0:
+                    self.elastic_jobs[i].resize_time -= tick
+                    if self.elastic_jobs[i].resize_time < 0.0:
+                        ratio = (self.elastic_jobs[i].resize_time * -1.0) / tick
+                        self.elastic_jobs[i].duration -= ratio * (tick * ((self.elastic_jobs[i].scaling_factor + 1.0) ** -1))
+                else:
+                    self.elastic_jobs[i].duration -= tick * ((self.elastic_jobs[i].scaling_factor + 1.0) ** -1)
             elif self.elastic_jobs[i].cur_nodes > self.elastic_jobs[i].nodes:
                 multiplier = float(self.elastic_jobs[i].cur_nodes / self.elastic_jobs[i].nodes)
-                self.elastic_jobs[i].duration -= tick * (multiplier * self.elastic_jobs[i].scaling_factor)
+                steps = math.log(multiplier, 2)
+                #self.elastic_jobs[i].duration -= tick * (multiplier * self.elastic_jobs[i].scaling_factor)
+                if self.elastic_jobs[i].resize_time >= 0:
+                    self.elastic_jobs[i].resize_time -= tick
+                    if self.elastic_jobs[i].resize_time < 0.0:
+                        ratio = (self.elastic_jobs[i].resize_time * -1.0) / tick
+                        self.elastic_jobs[i].duration -= ratio * (tick * ((self.elastic_jobs[i].scaling_factor + 1.0) ** steps))
+                else:
+                    self.elastic_jobs[i].duration -= tick * ((self.elastic_jobs[i].scaling_factor + 1.0) ** steps)
             else:
-                self.elastic_jobs[i].duration -= tick
+                if self.elastic_jobs[i].resize_time >= 0:
+                    self.elastic_jobs[i].resize_time -= tick
+                    if self.elastic_jobs[i].resize_time < 0.0:
+                        ratio = (self.elastic_jobs[i].resize_time * -1.0) / tick
+                        self.elastic_jobs[i].duration -= ratio * tick
+                else:
+                    self.elastic_jobs[i].duration -= tick
             #modifier = float(self.elastic_jobs[i].cur_nodes) / float(self.elastic_jobs[i].nodes)
             #self.elastic_jobs[i].duration -= tick * modifier
             self.elastic_jobs[i].run_time += tick
@@ -513,12 +688,12 @@ class PlotData:
         xval = 0
         line = f.readline().split(",")
         if line:
-            self.ceiling = int(line[a_idx]) + int(line[r_idx])
+            self.ceiling = float(line[a_idx]) + float(line[r_idx])
         else:
             print("Empty input file...")
             return False
         while len(line) > 1:
-            yval = int(line[r_idx])
+            yval = float(line[r_idx])
             
             self.x_data.append(xval)
             self.y_data.append(yval)

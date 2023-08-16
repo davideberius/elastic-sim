@@ -16,12 +16,12 @@ In order to reproduce the results from our SC23 paper submission, one must condu
   * ./simulator.py configs/cori_knl_inelastic.conf
 * Run the trials for the different elastic configurations
   * Be sure to put the results from each of these runs in their own directories
-  * ./uniform_scaling_trials.py
-  * ./aggressive_shrink_trials.py
-  * ./aggressive_priority_trials.py
+  * ./conservative_trials.py
+  * ./aggressive_grow_trials.py
+  * ./dynamic_trials.py
 * Copy the inelastic _stats.txt file for each of the machines into the elastic tests directories
 * Run the plot_trials.py utility on each of the output directories
-  * For example, if you stored the uniform scaling results in a directory called 'uniform_scaling', a plot might look like the following:
-    * ./plot_trials.py uniform_scaling/output_trials_perlmutter_gpu/perlmutter_gpu_
+  * For example, if you stored the conservative results in a directory called 'conservative', a plot might look like the following:
+    * ./plot_trials.py conservative/output_trials_perlmutter_gpu/perlmutter_gpu_
 * Run the multibar.py utility to get the bar plots we used in the paper
-  * This utility assumes that you named your output directories for the trials: 'uniform_scaling', 'aggressive_shrink', and 'aggressive_priority'
+  * This utility assumes that you named your output directories for the trials: 'conservative', 'aggressive_grow', and 'dynamic'
